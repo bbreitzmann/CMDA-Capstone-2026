@@ -325,7 +325,6 @@ print(classification_report(y_val, final_predictions))
 
 
 # XGBoost Cascade Implementation
-print("\n" + "="*50)
 print("Training XGBoost Cascade...")
 
 # Train the XGBoost Anomaly Trigger
