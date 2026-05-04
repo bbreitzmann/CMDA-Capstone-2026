@@ -4,9 +4,9 @@ library(reticulate)
 
 
 # File paths
-meta_path <- "Documents/VT_Undergrad/Spring_25:26/CMDA_4864_CAPSTONE/team_repo/meta.csv"
-ctx_path  <- "Documents/VT_Undergrad/Spring_25:26/CMDA_4864_CAPSTONE/team_repo/X_ctx.csv"
-x_ts_path <- "Documents/VT_Undergrad/Spring_25:26/CMDA_4864_CAPSTONE/team_repo/X_ts.npy"
+meta_path <- "Documents/VT_Undergrad/Spring_25:26/CMDA_4864_CAPSTONE/team_repo/data/meta.csv"
+ctx_path  <- "Documents/VT_Undergrad/Spring_25:26/CMDA_4864_CAPSTONE/team_repo/data/X_ctx.csv"
+x_ts_path <- "Documents/VT_Undergrad/Spring_25:26/CMDA_4864_CAPSTONE/team_repo/data/X_ts.npy"
 
 
 # Load data
@@ -134,7 +134,7 @@ print(label_counts)
 ggplot(label_counts, aes(x = event_type_name, y = n)) +
   geom_col() +
   labs(
-    title = "EVENT_TYPE Distribution",
+    title = "Event Type Distribution",
     x = "Event Type",
     y = "Count"
   )
@@ -143,7 +143,7 @@ ggplot(label_counts, aes(x = event_type_name, y = prop)) +
   geom_col() +
   scale_y_continuous(labels = scales::percent_format()) +
   labs(
-    title = "EVENT_TYPE Proportion",
+    title = "Event Type Proportion",
     x = "Event Type",
     y = "Proportion"
   )
@@ -538,7 +538,7 @@ set.seed(1)
 sampled_events <- ts_long %>%
   distinct(EVENT_ID, event_type_name) %>%
   group_by(event_type_name) %>%
-  slice_sample(n = min(5, n())) %>%
+  slice_sample(n = 5) %>%
   ungroup()
 
 ts_examples <- ts_long %>%
@@ -566,7 +566,7 @@ ts_mean %>%
     y = "Speed",
     color = "Event Type"
   )
-
+ggsave("speed_profile.png", width = 10, height = 6, units = "in", dpi = 300)
 
 # Focused acceleration plot
 ts_mean %>%
@@ -579,7 +579,7 @@ ts_mean %>%
     y = "accel_z",
     color = "Event Type"
   )
-
+ggsave("accel_z_profile.png", width = 10, height = 6, units = "in", dpi = 300)
 
 # Focused gyro plot
 ts_mean %>%
@@ -592,4 +592,4 @@ ts_mean %>%
     y = "gyro_y",
     color = "Event Type"
   )
-
+ggsave("gyro_profile.png", width = 10, height = 6, units = "in", dpi = 300)

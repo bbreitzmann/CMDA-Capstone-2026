@@ -1,0 +1,18 @@
+Metric,Value
+Original Accuracy,0.6720
+Auto-Labeler Accuracy,0.7387
+Improvement,0.0667
+
+LEARNED FEATURE WEIGHTS
+Feature,Weight
+Conflict,0.22183041797325836
+Bump,0.1266566712102123
+Hard Brake,0.2830466864421821
+Not SCE,0.3684662243743472
+
+CONFUSION MATRIX (1=Conf, 2=Bump, 3=HB, 4=NotSCE)
+,0,1,2,3
+0,77,3,14,9
+1,15,11,0,4
+2,8,1,66,5
+3,23,4,12,123

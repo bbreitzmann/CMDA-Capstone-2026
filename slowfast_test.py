@@ -1,9 +1,8 @@
-#pip install torch torchvision pytorchvideo
 
 import sys
 from types import ModuleType
 try:
-    import torchvision.transforms.functional_tensor
+    import torchvision.transforms.functional_tensor  # type: ignore
 except ImportError:
     import torchvision.transforms.functional as F_base
     fake_module = ModuleType("torchvision.transforms.functional_tensor")
@@ -11,398 +10,412 @@ except ImportError:
         setattr(fake_module, attr, getattr(F_base, attr))
     sys.modules["torchvision.transforms.functional_tensor"] = fake_module
 
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import json
-import glob
-import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from pathlib import Path
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import GroupShuffleSplit
+from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms import Normalize, Resize
 from tqdm import tqdm
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, accuracy_score
-from xgboost import XGBClassifier
-from sklearn.utils.class_weight import compute_sample_weight
 
-
-from pytorchvideo.models.hub import slowfast_r50
 from pytorchvideo.data.encoded_video import EncodedVideo
-from torchvision.transforms import Compose, Lambda, Normalize
-from pytorchvideo.transforms import ShortSideScale, UniformTemporalSubsample
+from pytorchvideo.models.hub import slowfast_r50
+from pytorchvideo.transforms import UniformTemporalSubsample
+
+# =========================================================
+# CONFIG
+# =========================================================
+LABELS_DIR = Path("data/100k/train")
+BDD_META_PATH = Path("data/downloaded_videos_meta.csv")
+VIDEO_DIR = Path("data/annotated_videos_only")
+
+CACHE_DIR = Path("data/slowfast_video_only")
+TENSOR_DIR = CACHE_DIR / "transformed_tensors"
+EMBED_DIR = CACHE_DIR / "embeddings"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+TENSOR_DIR.mkdir(parents=True, exist_ok=True)
+EMBED_DIR.mkdir(parents=True, exist_ok=True)
+
+SPLITS_PATH = CACHE_DIR / "video_only_splits.csv"
+MODEL_PATH = CACHE_DIR / "slowfast_video_head_best.pth"
+
+CLIP_START_SEC = 10
+CLIP_END_SEC = 18
+RESIZE_HW = (256, 455)
+BATCH_SIZE = 16
+EPOCHS = 15
+LEARNING_RATE = 1e-3
+SEED = 1
+NUM_CLASSES = 4
+
+CLASS_MAP_STR = {
+    0: "Conflict",
+    1: "Bump",
+    2: "Hard Brake",
+    3: "Not an SCE",
+}
+
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+    print("Using CUDA GPU!")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+    print("Using Apple Silicon (MPS) GPU!")
+else:
+    DEVICE = torch.device("cpu")
+    print("Using CPU.")
 
 
-labels_dir = Path(r"C:\Users\brend\OneDrive\Capstone\CMDA-Capstone-2026\train")
-telemetry_dir = Path(r"C:\Users\brend\OneDrive\Capstone\CMDA-Capstone-2026\train")
-bdd_df = pd.read_csv("C:/Users/brend/Downloads/bdd_sce.csv")
+# =========================================================
+# REPRODUCIBILITY
+# =========================================================
+def set_seed(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-json_dir_inf = r"C:\Users\brend\Downloads\kinematic_data"
-video_dir_inf = r"C:\Users\brend\Downloads\extracted_videos"
-meta_csv_path_inf = r"C:\Users\brend\Downloads\downloaded_videos_meta - downloaded_videos_meta.csv"
+# =========================================================
+# MODELS
+# =========================================================
+class SlowFastTransform:
+    def __init__(self) -> None:
+        self.force_landscape = Resize(RESIZE_HW)
+        self.normalize = Normalize([0.45] * 3, [0.225] * 3)
+        self.slow_subsample = UniformTemporalSubsample(8)
+        self.fast_subsample = UniformTemporalSubsample(32)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-CLASS_MAP_STR = {1: "Conflict", 2: "Bump", 3: "Hard Brake", 4: "Not an SCE"}
-
-
-valid_ids = set(bdd_df['BDD_ID'].unique())
-processed_data = []
-
-print("Processing JSON files...")
-
-for label_path in tqdm(list(labels_dir.glob("*.json")), desc="Extracting Features"):
-    BDD_ID = label_path.stem 
-    if BDD_ID not in valid_ids:
-        continue
-    telem_path = telemetry_dir / f"{BDD_ID}.json"
-    if not telem_path.exists():
-        continue
-
-    event_features = {"BDD_ID": BDD_ID}
-
-    with open(label_path, 'r') as f:
-        lbl_data = json.load(f)
-        attrs = lbl_data.get("attributes", {})
-        event_features['weather'] = attrs.get("weather", "unknown")
-        event_features['timeofday'] = attrs.get("timeofday", "unknown")
-        
-        frames = lbl_data.get("frames", [])
-        if frames:
-            objects = frames[0].get("objects", [])
-            event_features['num_cars'] = sum(1 for obj in objects if obj.get("category") == "car")
-            event_features['num_pedestrians'] = sum(1 for obj in objects if obj.get("category") == "pedestrian")
-            event_features['num_trucks'] = sum(1 for obj in objects if obj.get("category") == "truck")
-            event_features['total_objects'] = len(objects)
-            
-            event_features['has_vru'] = 1 if (event_features['num_pedestrians'] > 0 or 
-                                              sum(1 for obj in objects if obj.get("category") in ["rider", "bicycle"]) > 0) else 0
-            
-            IMAGE_AREA = 1280 * 720
-            max_area = 0
-            drivable_area = 0
-            
-            for obj in objects:
-                if "box2d" in obj:
-                    box = obj["box2d"]
-                    area = (box["x2"] - box["x1"]) * (box["y2"] - box["y1"])
-                    if area > max_area:
-                        max_area = area
-                elif obj.get("category") == "area/drivable" and "poly2d" in obj:
-                    poly = obj["poly2d"]
-                    x = np.array([p[0] for p in poly if isinstance(p[0], (int, float))])
-                    y = np.array([p[1] for p in poly if isinstance(p[1], (int, float))])
-                    if len(x) > 2 and len(x) == len(y):
-                        drivable_area += 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
-
-            event_features['max_object_ratio'] = max_area / IMAGE_AREA
-            event_features['drivable_area_ratio'] = drivable_area / IMAGE_AREA
-
-    with open(telem_path, 'r') as f:
-        tel_data = json.load(f) 
-        label_ts = 0
-        if frames and "timestamp" in frames[0]:
-            label_ts = frames[0]["timestamp"] 
-            
-        start_time = tel_data.get("startTime", 0)
-        event_time_unix = start_time + label_ts
-        
-        lookback_ms = 6000 
-        lookforward_ms = 10000 
-        min_time = event_time_unix - lookback_ms
-        max_time = event_time_unix + lookforward_ms
-        
-        accel = tel_data.get("accelerometer", [])
-        if accel:
-            window_accel = [a for a in accel if min_time <= a['timestamp'] <= max_time]
-            if window_accel:
-                accel_x = np.array([a['x'] for a in window_accel])
-                accel_y = np.array([a['y'] for a in window_accel])
-                accel_z = np.array([a['z'] for a in window_accel])
-                event_features['accel_z_min'] = np.percentile(accel_z, 1) 
-                event_features['accel_z_max'] = np.percentile(accel_z, 99) 
-                event_features['accel_x_std'] = np.std(accel_x) 
-                accel_magnitude = np.sqrt(accel_x**2 + accel_y**2 + accel_z**2)
-                event_features['max_g_force'] = np.percentile(accel_magnitude, 99)
-                if len(accel_z) > 1:
-                    jerk_z = np.diff(accel_z)
-                    event_features['max_jerk_z'] = np.percentile(np.abs(jerk_z), 99)
-                else:
-                    event_features['max_jerk_z'] = 0
-            
-        gyro = tel_data.get("gyro", [])
-        if gyro:
-            window_gyro = [g for g in gyro if min_time <= g['timestamp'] <= max_time]
-            if window_gyro:
-                gyro_y = [g['y'] for g in window_gyro] 
-                event_features['gyro_yaw_max_abs'] = np.percentile(np.abs(gyro_y), 99) 
-
-        locations = tel_data.get("locations", [])
-        if locations:
-            global_speeds = np.array([loc.get("speed", 0) for loc in locations])
-            if len(global_speeds) >= 3:
-                event_features['global_speed_end'] = np.mean(global_speeds[-3:])
-            else:
-                event_features['global_speed_end'] = 0
-
-            window_locs = [loc for loc in locations if min_time <= loc['timestamp'] <= max_time]
-            if window_locs:
-                speeds = np.array([loc.get("speed", 0) for loc in window_locs])
-                event_features['speed_mean'] = np.mean(speeds)
-                event_features['speed_std'] = np.std(speeds)
-                if len(speeds) >= 3:
-                    event_features['speed_start'] = np.mean(speeds[:3])
-                    event_features['speed_end'] = np.mean(speeds[-3:])
-                else:
-                    event_features['speed_end'] = speeds[-1] if len(speeds) > 0 else 0
-                    event_features['speed_start'] = speeds[0] if len(speeds) > 0 else 0
-                event_features['total_speed_change'] = event_features['speed_start'] - event_features['speed_end']
-                if len(speeds) > 1:
-                    speed_changes = np.diff(speeds)
-                    event_features['max_deceleration'] = np.percentile(speed_changes, 1)
-                else:
-                    event_features['max_deceleration'] = 0
-
-    processed_data.append(event_features)
-
-features_df = pd.DataFrame(processed_data).fillna(0)
-final_model_df = features_df.merge(bdd_df[['BDD_ID', 'EVENT_TYPE', 'CONFLICT_TYPE']], on='BDD_ID', how='inner')
+    def __call__(self, x: torch.Tensor) -> List[torch.Tensor]:
+        x = x / 255.0
+        x = self.force_landscape(x)
+        x = x.permute(1, 0, 2, 3)
+        x = self.normalize(x)
+        x = x.permute(1, 0, 2, 3)
+        return [self.slow_subsample(x), self.fast_subsample(x)]
 
 
-unique_ids = final_model_df['BDD_ID'].unique().tolist()
-np.random.seed(1)
-np.random.shuffle(unique_ids)
-train_cutoff = int(0.70 * len(unique_ids))
-val_cutoff = int(0.85 * len(unique_ids)) 
-
-train_ids = unique_ids[:train_cutoff]
-val_ids = unique_ids[train_cutoff:val_cutoff]
-test_ids = unique_ids[val_cutoff:]
-
-train_df = final_model_df[final_model_df['BDD_ID'].isin(train_ids)]
-val_df = final_model_df[final_model_df['BDD_ID'].isin(val_ids)]
-test_df = final_model_df[final_model_df['BDD_ID'].isin(test_ids)]
-
-train_encoded = pd.get_dummies(train_df, columns=['weather', 'timeofday'])
-val_encoded = pd.get_dummies(val_df, columns=['weather', 'timeofday']).reindex(columns=train_encoded.columns, fill_value=0)
-test_encoded = pd.get_dummies(test_df, columns=['weather', 'timeofday']).reindex(columns=train_encoded.columns, fill_value=0)
-
-drop_cols = ['BDD_ID', 'EVENT_TYPE', 'CONFLICT_TYPE'] 
-X_train, y_train = train_encoded.drop(columns=drop_cols), train_encoded['EVENT_TYPE']
-X_val, y_val = val_encoded.drop(columns=drop_cols), val_encoded['EVENT_TYPE']
-X_test, y_test = test_encoded.drop(columns=drop_cols), test_encoded['EVENT_TYPE']
-
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_val_scaled = scaler.transform(X_val)
-X_test_scaled = scaler.transform(X_test)
-
-
-print("\n" + "="*50)
-print("TRAINING RANDOM FOREST CASCADE...")
-y_train_binary = y_train.apply(lambda x: 0 if x == 4 else 1)
-y_val_binary = y_val.apply(lambda x: 0 if x == 4 else 1)
-rf_trigger = RandomForestClassifier(n_estimators=100, random_state=42).fit(X_train_scaled, y_train_binary)
-
-event_mask_train = (y_train != 4)
-rf_classifier = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42).fit(X_train_scaled[event_mask_train], y_train[event_mask_train])
-
-
-val_preds_binary = rf_trigger.predict(X_val_scaled)
-final_predictions = np.full(len(y_val), 4)
-event_indices = np.where(val_preds_binary == 1)[0]
-if len(event_indices) > 0:
-    final_predictions[event_indices] = rf_classifier.predict(X_val_scaled[event_indices])
-
-print("\nPHASE 3: FULL CASCADED PIPELINE EVALUATION (RANDOM FOREST)")
-print("Validation Accuracy:", accuracy_score(y_val, final_predictions))
-print(classification_report(y_val, final_predictions))
-
-print("\n" + "="*50)
-print("TRAINING XGBOOST CASCADE...")
-xgb_trigger = XGBClassifier(random_state=42, eval_metric='logloss').fit(X_train_scaled, y_train_binary)
-le = LabelEncoder()
-y_train_events_encoded = le.fit_transform(y_train[event_mask_train])
-xgb_classifier = XGBClassifier(random_state=42, eval_metric='mlogloss').fit(X_train_scaled[event_mask_train], y_train_events_encoded, sample_weight=compute_sample_weight(class_weight='balanced', y=y_train_events_encoded))
-
-
-val_preds_binary_xgb = xgb_trigger.predict(X_val_scaled)
-final_predictions_xgb = np.full(len(y_val), 4)
-event_indices_xgb = np.where(val_preds_binary_xgb == 1)[0]
-if len(event_indices_xgb) > 0:
-    final_predictions_xgb[event_indices_xgb] = le.inverse_transform(xgb_classifier.predict(X_val_scaled[event_indices_xgb]))
-
-print("\nPHASE 3: FULL CASCADED PIPELINE EVALUATION (XGBOOST)")
-print("Validation Accuracy:", accuracy_score(y_val, final_predictions_xgb))
-print(classification_report(y_val, final_predictions_xgb))
-
-
-class HybridSuperModel(nn.Module):
-    def __init__(self, num_kin_features, num_classes=4):
+class SlowFastEmbeddingExtractor(nn.Module):
+    """
+    Frozen SlowFast backbone that outputs the 2304-d pooled video embedding.
+    """
+    def __init__(self) -> None:
         super().__init__()
-        
-        self.slowfast = slowfast_r50(pretrained=True)
-        self.slowfast.blocks[6].proj = nn.Identity() 
-        
-        
-        self.kin_net = nn.Sequential(
-            nn.Linear(num_kin_features, 128),
+        self.backbone = slowfast_r50(pretrained=True)
+        self.backbone.blocks[6].proj = nn.Identity()
+
+    def forward(self, video_pathway: List[torch.Tensor]) -> torch.Tensor:
+        return self.backbone(video_pathway)
+
+
+class VideoOnlySlowFastHead(nn.Module):
+    """
+    Small MLP head on top of precomputed SlowFast embeddings.
+    This isolates the video branch first.
+    """
+    def __init__(self, in_dim: int = 2304, num_classes: int = NUM_CLASSES) -> None:
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(in_dim, 512),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Dropout(0.3),
+            nn.Linear(512, 128),
             nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU()
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes),
         )
-        
-        
+
+    def forward(self, video_embedding: torch.Tensor) -> torch.Tensor:
+        return self.head(video_embedding)
+
+
+class FutureFusionHead(nn.Module):
+    """
+    Placeholder for later fusion with kinematics/context.
+    Keep this for the next phase after video-only is stable.
+    """
+    def __init__(self, video_dim: int, aux_dim: int, num_classes: int = NUM_CLASSES) -> None:
+        super().__init__()
+        self.video_proj = nn.Sequential(
+            nn.Linear(video_dim, 256),
+            nn.ReLU(),
+        )
+        self.aux_proj = nn.Sequential(
+            nn.Linear(aux_dim, 128),
+            nn.ReLU(),
+        )
         self.classifier = nn.Sequential(
-            nn.Linear(2304 + 32, 256),
+            nn.Linear(256 + 128, 128),
             nn.ReLU(),
-            nn.Linear(256, num_classes)
+            nn.Linear(128, num_classes),
         )
 
-    def forward(self, video_pathway, kinematic_data):
-        v_feats = self.slowfast(video_pathway)
-        k_feats = self.kin_net(kinematic_data)
-        return self.classifier(torch.cat((v_feats, k_feats), dim=1))
+    def forward(self, video_embedding: torch.Tensor, aux_features: torch.Tensor) -> torch.Tensor:
+        v = self.video_proj(video_embedding)
+        a = self.aux_proj(aux_features)
+        return self.classifier(torch.cat([v, a], dim=1))
 
 
-print("\n" + "="*50)
-print("PHASE 4: HYBRID SLOWFAST INFERENCE (FOR EXTRACTED VIDEOS)")
+# =========================================================
+# DATASETS
+# =========================================================
+class VideoEmbeddingDataset(Dataset):
+    def __init__(self, dataframe: pd.DataFrame) -> None:
+        self.df = dataframe.reset_index(drop=True)
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        embedding = torch.load(row["embedding_path"], map_location="cpu", weights_only=False).float()
+        target = int(row["target_idx"])
+        bdd_id = row["BDD_ID"]
+        return embedding, target, bdd_id
 
 
-model_hybrid = HybridSuperModel(num_kin_features=X_train.shape[1]).to(device).eval()
+# =========================================================
+# METADATA / SPLITS
+# =========================================================
+def build_video_metadata() -> pd.DataFrame:
+    bdd_df = pd.read_csv(BDD_META_PATH).copy()
+    bdd_df["BDD_ID"] = bdd_df["BDD_ID"].astype(str)
 
-video_transform = Compose([
-    Lambda(lambda x: x / 255.0),
-    ShortSideScale(size=256),
-    Lambda(lambda x: x.permute(1, 0, 2, 3)),
-    Normalize([0.45]*3, [0.225]*3),
-    Lambda(lambda x: x.permute(1, 0, 2, 3)),
-    Lambda(lambda x: [UniformTemporalSubsample(8)(x), UniformTemporalSubsample(32)(x)])
-])
+    # Keep only labels that actually have videos available.
+    video_map = {p.stem: p for p in VIDEO_DIR.iterdir() if p.suffix == ".mov"}
+    df = bdd_df[bdd_df["BDD_ID"].isin(video_map.keys())].copy()
 
-
-meta_df_inf = pd.read_csv(meta_csv_path_inf)
-
-
-print("\n" + "="*50)
-print("PHASE 4.5: TRAINING THE HYBRID AI ON LOCAL VIDEOS")
+    # Expect EVENT_TYPE in {1,2,3,4}; convert to 0-based for PyTorch.
+    df["target_idx"] = df["EVENT_TYPE"].astype(int) - 1
+    df["video_path"] = df["BDD_ID"].map(lambda x: str(video_map[x]))
+    return df.reset_index(drop=True)
 
 
-for param in model_hybrid.slowfast.parameters():
-    param.requires_grad = False
-for param in model_hybrid.slowfast.blocks[6].parameters():
-    param.requires_grad = True
+def build_group_splits(df: pd.DataFrame, seed: int = SEED) -> pd.DataFrame:
+    groups = df["BDD_ID"].astype(str).to_numpy()
+    y = df["target_idx"].to_numpy()
+
+    gss1 = GroupShuffleSplit(n_splits=1, train_size=0.70, random_state=seed)
+    train_idx, temp_idx = next(gss1.split(df, y, groups=groups))
+
+    temp_df = df.iloc[temp_idx].copy()
+    temp_groups = temp_df["BDD_ID"].astype(str).to_numpy()
+    temp_y = temp_df["target_idx"].to_numpy()
+
+    gss2 = GroupShuffleSplit(n_splits=1, train_size=0.50, random_state=seed)
+    val_rel, test_rel = next(gss2.split(temp_df, temp_y, groups=temp_groups))
+
+    df = df.copy()
+    df["split"] = "train"
+    df.iloc[temp_idx, df.columns.get_loc("split")] = "temp"
+    df.iloc[temp_idx[val_rel], df.columns.get_loc("split")] = "val"
+    df.iloc[temp_idx[test_rel], df.columns.get_loc("split")] = "test"
+
+    return df
 
 
-class_weights = torch.tensor([4.0, 2.0, 2.0, 1.0]).to(device)
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model_hybrid.parameters()), lr=1e-4)
+# =========================================================
+# PRECOMPUTE VIDEO ARTIFACTS
+# =========================================================
+def load_and_transform_video(video_path: Path, transform: SlowFastTransform) -> Optional[List[torch.Tensor]]:
+    try:
+        video = EncodedVideo.from_path(str(video_path))
+        clip = video.get_clip(start_sec=CLIP_START_SEC, end_sec=CLIP_END_SEC)
+        if clip is None or "video" not in clip or clip["video"] is None:
+            print(f"Skipping {video_path.name}: empty clip")
+            return None
+        frames = transform(clip["video"])
+        return [f.cpu() for f in frames]
+    except Exception as e:
+        print(f"Failed on video {video_path.stem}: {e}")
+        return None
 
 
-model_hybrid.train() 
+@torch.no_grad()
+def precompute_tensors_and_embeddings(df: pd.DataFrame) -> pd.DataFrame:
+    print("\n" + "=" * 60)
+    print("PRECOMPUTING SLOWFAST TENSORS AND VIDEO EMBEDDINGS")
 
-epochs = 5
-extracted_vids_train = [f for f in os.listdir(video_dir_inf) if f.endswith('.mov')]
+    transform = SlowFastTransform()
+    extractor = SlowFastEmbeddingExtractor().to(DEVICE)
+    extractor.eval()
+    for p in extractor.parameters():
+        p.requires_grad = False
 
-for epoch in range(epochs):
-    epoch_loss = 0
-    
-    for vid_file in tqdm(extracted_vids_train, desc=f"Training Epoch {epoch+1}/{epochs}", leave=False):
-        bdd_id = vid_file.replace('.mov', '')
+    df = df.copy()
+    df["tensor_path"] = None
+    df["embedding_path"] = None
 
-        
-        if bdd_id not in final_model_df['BDD_ID'].values: continue
-        row = final_model_df[final_model_df['BDD_ID'] == bdd_id].iloc[0]
+    kept_rows = []
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Precomputing video artifacts"):
+        bdd_id = row["BDD_ID"]
+        video_path = Path(row["video_path"])
+        tensor_path = TENSOR_DIR / f"{bdd_id}.pt"
+        embedding_path = EMBED_DIR / f"{bdd_id}.pt"
 
-        
-        target_idx = int(row['EVENT_TYPE']) - 1
-        target = torch.tensor([target_idx]).to(device)
+        if not tensor_path.exists():
+            frames = load_and_transform_video(video_path, transform)
+            if frames is None:
+                continue
+            torch.save({"slow": frames[0], "fast": frames[1]}, tensor_path)
+        else:
+            saved = torch.load(tensor_path, map_location="cpu", weights_only=False)
+            frames = [saved["slow"], saved["fast"]]
 
-        
-        kin_row = final_model_df[final_model_df['BDD_ID'] == bdd_id].drop(columns=['BDD_ID', 'EVENT_TYPE', 'CONFLICT_TYPE'])
-        kin_row_encoded = pd.get_dummies(kin_row, columns=['weather', 'timeofday']).reindex(columns=X_train.columns, fill_value=0)
-        kin_scaled = scaler.transform(kin_row_encoded)
-        kin_tensor = torch.tensor(kin_scaled, dtype=torch.float32).to(device)
+        if not embedding_path.exists():
+            frames_device = [f.unsqueeze(0).to(DEVICE) for f in frames]
+            embedding = extractor(frames_device).squeeze(0).detach().cpu()
+            torch.save(embedding, embedding_path)
 
-        try:
-            
-            video = EncodedVideo.from_path(os.path.join(video_dir_inf, vid_file))
-            clip = video.get_clip(start_sec=10, end_sec=18)
-            frames = [f.unsqueeze(0).to(device) for f in video_transform(clip['video'])]
+            del embedding, frames_device
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
+            elif DEVICE.type == "mps":
+                torch.mps.empty_cache()
 
-            
+        df.at[idx, "tensor_path"] = str(tensor_path)
+        df.at[idx, "embedding_path"] = str(embedding_path)
+        kept_rows.append(idx)
+
+    df = df.loc[kept_rows].reset_index(drop=True)
+    df.to_csv(SPLITS_PATH, index=False)
+    print(f"Saved video-only metadata to: {SPLITS_PATH}")
+    return df
+
+
+# =========================================================
+# TRAINING / EVALUATION
+# =========================================================
+def make_loaders(df: pd.DataFrame) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    train_df = df[df["split"] == "train"].copy()
+    val_df = df[df["split"] == "val"].copy()
+    test_df = df[df["split"] == "test"].copy()
+
+    train_loader = DataLoader(VideoEmbeddingDataset(train_df), batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=False)
+    val_loader = DataLoader(VideoEmbeddingDataset(val_df), batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False)
+    test_loader = DataLoader(VideoEmbeddingDataset(test_df), batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False)
+    return train_loader, val_loader, test_loader
+
+
+def evaluate_loader(model: nn.Module, loader: DataLoader) -> Tuple[float, List[int], List[int], List[str]]:
+    model.eval()
+    y_true: List[int] = []
+    y_pred: List[int] = []
+    ids: List[str] = []
+
+    with torch.no_grad():
+        for batch_emb, batch_targets, batch_ids in loader:
+            batch_emb = batch_emb.to(DEVICE)
+            logits = model(batch_emb)
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+
+            y_true.extend(batch_targets.numpy().tolist())
+            y_pred.extend(preds.tolist())
+            ids.extend(list(batch_ids))
+
+    acc = accuracy_score(y_true, y_pred)
+    return acc, y_true, y_pred, ids
+
+
+def train_video_only_model(df: pd.DataFrame) -> VideoOnlySlowFastHead:
+    train_loader, val_loader, _ = make_loaders(df)
+
+    model = VideoOnlySlowFastHead().to(DEVICE)
+
+    train_targets = df[df["split"] == "train"]["target_idx"].to_numpy()
+    class_counts = np.bincount(train_targets, minlength=NUM_CLASSES)
+    class_weights = len(train_targets) / (NUM_CLASSES * np.maximum(class_counts, 1))
+    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    best_val_acc = -1.0
+    for epoch in range(EPOCHS):
+        model.train()
+        running_loss = 0.0
+        total = 0
+        correct = 0
+
+        for batch_emb, batch_targets, _ in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}", leave=False):
+            batch_emb = batch_emb.to(DEVICE)
+            batch_targets = batch_targets.to(DEVICE)
+
             optimizer.zero_grad()
-            logits = model_hybrid(frames, kin_tensor)
-            loss = criterion(logits, target)
+            logits = model(batch_emb)
+            loss = criterion(logits, batch_targets)
             loss.backward()
             optimizer.step()
-            
-            epoch_loss += loss.item()
-        except Exception as e:
-            continue
-            
-    print(f"Epoch {epoch+1} Completed | Total Error (Loss): {epoch_loss:.4f}")
 
-# Save the trained weights
-save_path = r"C:\Users\brend\OneDrive\Capstone\CMDA-Capstone-2026\hybrid_model_weights.pth"
-torch.save(model_hybrid.state_dict(), save_path)
-print(f"\nModel weights successfully saved to: {save_path}")
+            running_loss += loss.item() * batch_targets.size(0)
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == batch_targets).sum().item()
+            total += batch_targets.size(0)
+
+            del logits, loss, preds
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
+            elif DEVICE.type == "mps":
+                torch.mps.empty_cache()
+
+        train_loss = running_loss / max(total, 1)
+        train_acc = correct / max(total, 1)
+        val_acc, _, _, _ = evaluate_loader(model, val_loader)
+
+        print(f"Epoch {epoch + 1:02d} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), MODEL_PATH)
+
+    print(f"\nBest video-only model saved to: {MODEL_PATH}")
+    return model
 
 
-model_hybrid.eval()
+def evaluate_test(model: VideoOnlySlowFastHead, df: pd.DataFrame) -> None:
+    _, _, test_loader = make_loaders(df)
+    acc, y_true, y_pred, ids = evaluate_loader(model, test_loader)
 
-print("\n" + "="*100)
-print(f"{'VIDEO ID':<20} | {'XGBOOST PRED':<15} | {'HYBRID AI PRED':<18} | {'ACTUAL (GT)':<15} | {'WIN'}")
-print("-" * 100)
+    print("\n" + "=" * 80)
+    print("VIDEO-ONLY SLOWFAST TEST RESULTS")
+    print(f"Test Accuracy: {acc:.4f}")
+    print(classification_report(y_true, y_pred, target_names=[CLASS_MAP_STR[i] for i in range(NUM_CLASSES)]))
 
-extracted_vids = [f for f in os.listdir(video_dir_inf) if f.endswith('.mov')]
-for vid_file in tqdm(extracted_vids, desc="Processing Individual Videos"):
-    bdd_id = vid_file.replace('.mov', '')
-    
-    
-    if bdd_id not in final_model_df['BDD_ID'].values: continue
-    row = final_model_df[final_model_df['BDD_ID'] == bdd_id].iloc[0]
-    
-    
-    kin_row = final_model_df[final_model_df['BDD_ID'] == bdd_id].drop(columns=['BDD_ID', 'EVENT_TYPE', 'CONFLICT_TYPE'])
-    kin_row_encoded = pd.get_dummies(kin_row, columns=['weather', 'timeofday']).reindex(columns=X_train.columns, fill_value=0)
-    kin_scaled = scaler.transform(kin_row_encoded)
-    kin_tensor = torch.tensor(kin_scaled, dtype=torch.float32).to(device)
-    
-    
-    xgb_bin = xgb_trigger.predict(kin_scaled)[0]
-    if xgb_bin == 0:
-        xgb_label = "Not an SCE"
-    else:
-        xgb_enc = xgb_classifier.predict(kin_scaled)
-        xgb_label = CLASS_MAP_STR[le.inverse_transform(xgb_enc)[0]]
+    results = pd.DataFrame({
+        "BDD_ID": ids,
+        "true_idx": y_true,
+        "pred_idx": y_pred,
+        "true_label": [CLASS_MAP_STR[i] for i in y_true],
+        "pred_label": [CLASS_MAP_STR[i] for i in y_pred],
+    })
+    results_path = CACHE_DIR / "video_only_test_predictions.csv"
+    results.to_csv(results_path, index=False)
+    print(f"Saved per-video test predictions to: {results_path}")
+    print("=" * 80)
 
-    
-    try:
-        video = EncodedVideo.from_path(os.path.join(video_dir_inf, vid_file))
-        
-        clip = video.get_clip(start_sec=10, end_sec=18)
-        frames = [f.unsqueeze(0).to(device) for f in video_transform(clip['video'])]
-        
-        with torch.no_grad():
-            logits = model_hybrid(frames, kin_tensor)
-            ai_idx = torch.argmax(logits).item()
-            
-            ai_label = ["Conflict", "Bump", "Hard Brake", "Not an SCE"][ai_idx]
-    except Exception as e:
-        ai_label = "Error"
 
-    
-    gt_val = row['EVENT_TYPE']
-    gt_label = CLASS_MAP_STR[gt_val]
+def main() -> None:
+    set_seed(SEED)
 
-    match_marker = "✓" if ai_label == gt_label else "✗"
-    print(f"{bdd_id[:18]:<20} | {xgb_label:<15} | {ai_label:<18} | {gt_label:<15} | {match_marker}")
+    df = build_video_metadata()
+    df = build_group_splits(df, seed=SEED)
+    df = precompute_tensors_and_embeddings(df)
 
-print("="*100)
+    model = train_video_only_model(df)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False))
+    evaluate_test(model, df)
+
+    print("\nNext step:")
+    print("- keep these saved SlowFast embeddings")
+    print("- train your kinematics/context model separately")
+    print("- concatenate video embedding + kinematics embedding with a small fusion head")
+
+
+if __name__ == "__main__":
+    main()
